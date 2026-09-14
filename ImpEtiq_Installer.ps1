@@ -35,6 +35,7 @@ $BaseDir = [System.IO.Path]::GetDirectoryName(
 # -------------------------
 
 $LogFile  = "C:\impetiq_install.log"
+$InstallerStart = Get-Date
 $NodeDir  = "C:\Program Files\nodejs"
 $NodeExe  = "$NodeDir\node.exe"
 $NpmCmd   = "$NodeDir\npm.cmd"
@@ -77,6 +78,10 @@ param(
 )
 
 Write-Log "ERROR: $Message"
+if ($InstallerStart) {
+    $elapsed = (Get-Date) - $InstallerStart
+    Write-Log "DURACION TOTAL: $($elapsed.ToString('hh\:mm\:ss'))"
+}
 
 if ($TranscriptEnabled) {
     try { Stop-Transcript | Out-Null } catch {}
@@ -102,11 +107,68 @@ try {
         ExitCode = $exitCode
     }
 }
+
 finally {
     $ErrorActionPreference = $previousErrorActionPreference
 }
 }
 
+function Get-ApplicationFiles {
+param([string]$Path)
+
+Get-ChildItem -LiteralPath $Path -Force | Where-Object {
+    $_.Name -ne ".env" -and $_.Name -ne "data" -and $_.Name -ne "logs" -and $_.Name -ne "node_modules"
+} | ForEach-Object {
+    if ($_.PSIsContainer) {
+        Get-ApplicationFiles -Path $_.FullName
+    }
+    else {
+        $_
+    }
+}
+}
+
+function Get-FileSha256 {
+param([string]$Path)
+
+$sha256 = [System.Security.Cryptography.SHA256]::Create()
+$stream = [System.IO.File]::OpenRead($Path)
+try {
+    $hashBytes = $sha256.ComputeHash($stream)
+    return ([System.BitConverter]::ToString($hashBytes)).Replace("-", "")
+}
+finally {
+    $stream.Dispose()
+    $sha256.Dispose()
+}
+}
+
+function Get-BackendSnapshot {
+param([string]$Path)
+
+$snapshot = @{}
+foreach ($file in (Get-ApplicationFiles -Path $Path)) {
+    $relativePath = $file.FullName.Substring($Path.Length).TrimStart('\')
+    $snapshot[$relativePath] = Get-FileSha256 -Path $file.FullName
+}
+return $snapshot
+}
+
+$CurrentStage = "Inicio"
+trap {
+    $unexpectedMessage = $_.Exception.Message
+    Write-Log "ERROR: Excepción inesperada en etapa [$CurrentStage]: $unexpectedMessage"
+    if ($InstallerStart) {
+        $unexpectedElapsed = (Get-Date) - $InstallerStart
+        Write-Log "DURACION TOTAL: $($unexpectedElapsed.ToString('hh\:mm\:ss'))"
+    }
+    if ($TranscriptEnabled) {
+        try { Stop-Transcript | Out-Null } catch {}
+    }
+    exit 1
+}
+
+Write-Log "INICIO INSTALADOR"
 Write-Log "=========================================="
 Write-Log "ImpEtiq Installer iniciado"
 Write-Log "BaseDir: $BaseDir"
@@ -119,14 +181,7 @@ Write-Log "=========================================="
 # -------------------------
 
 $TranscriptEnabled = $false
-
-try {
-Start-Transcript -Path $LogFile -Append -ErrorAction Stop
-$TranscriptEnabled = $true
-}
-catch {
-Write-Log "Transcript no disponible; se utiliza logging manual"
-}
+Write-Log "Logging manual activo; transcript deshabilitado"
 
 # -------------------------
 
@@ -487,68 +542,73 @@ Stop-Installer 50 "No se encontró el backend en $BackendSource"
 }
 
 $BackendExists = Test-Path $Backend
-
-# En una actualización, detener el servicio antes de reemplazar archivos.
-$ExistingService = Get-Service $ServiceName -ErrorAction SilentlyContinue
-if ($ExistingService -and $ExistingService.Status -eq "Running") {
-Write-Log "Deteniendo servicio antes de actualizar backend"
-Stop-Service $ServiceName -Force -ErrorAction Stop
-Start-Sleep -Seconds 3
-$stoppedService = Get-Service $ServiceName -ErrorAction SilentlyContinue
-if ($stoppedService -and $stoppedService.Status -ne "Stopped") {
-    Stop-Installer 52 "El servicio $ServiceName no quedó detenido antes de actualizar el backend."
-}
+$CurrentStage = "Detección de cambios del backend"
+$BackendChanged = $false
+$InitialService = Get-Service $ServiceName -ErrorAction SilentlyContinue
+$ServiceInitialStatus = $null
+if ($InitialService) {
+    $ServiceInitialStatus = $InitialService.Status.ToString()
+    Write-Log "Servicio existente: estado inicial $ServiceInitialStatus"
 }
 
 if (-not $BackendExists) {
-
-Write-Log "Instalación nueva: copiando backend completo"
-
-Copy-Item `
-    $BackendSource `
-    "C:\" `
-    -Recurse `
-    -Force
-
+    $BackendChanged = $true
+    Write-Log "Backend: CAMBIOS DETECTADOS"
+    Write-Log "Instalación nueva: copiando backend de aplicación"
+    New-Item -ItemType Directory -Path $Backend -Force | Out-Null
+    Get-ChildItem $BackendSource -Force | Where-Object {
+        $_.Name -ne "data" -and $_.Name -ne "logs" -and $_.Name -ne "node_modules"
+    } | ForEach-Object {
+        Copy-Item $_.FullName (Join-Path $Backend $_.Name) -Recurse -Force
+    }
 }
 else {
-
-Write-Log "Instalación existente: actualizando backend"
-
-# Preservar:
-# - .env
-# - data
-# - logs
-
-Get-ChildItem $BackendSource -Force | ForEach-Object {
-
-    $destination = Join-Path $Backend $_.Name
-
-    if ($_.Name -eq ".env") {
-
-        Write-Log "Preservando .env existente"
-
-    }
-    elseif ($_.Name -eq "data") {
-
-        Write-Log "Preservando directorio data existente"
-
-    }
-    elseif ($_.Name -eq "logs") {
-
-        Write-Log "Preservando directorio logs existente"
-
+    $sourceSnapshot = Get-BackendSnapshot -Path $BackendSource
+    $installedSnapshot = Get-BackendSnapshot -Path $Backend
+    if ($sourceSnapshot.Count -ne $installedSnapshot.Count) {
+        $BackendChanged = $true
     }
     else {
-
-        Copy-Item `
-            $_.FullName `
-            $destination `
-            -Recurse `
-            -Force
+        foreach ($relativePath in $sourceSnapshot.Keys) {
+            if (-not $installedSnapshot.ContainsKey($relativePath) -or
+                $installedSnapshot[$relativePath] -ne $sourceSnapshot[$relativePath]) {
+                $BackendChanged = $true
+                break
+            }
+        }
     }
-}
 
+    if ($BackendChanged) {
+        Write-Log "Backend: CAMBIOS DETECTADOS"
+        if ($InitialService -and $ServiceInitialStatus -eq "Running") {
+            Write-Log "Servicio detenido por actualización de backend"
+            Stop-Service $ServiceName -Force -ErrorAction Stop
+            Start-Sleep -Seconds 3
+            $stoppedService = Get-Service $ServiceName -ErrorAction SilentlyContinue
+            if ($stoppedService -and $stoppedService.Status -ne "Stopped") {
+                Stop-Installer 52 "El servicio $ServiceName no quedó detenido antes de actualizar el backend."
+            }
+        }
+
+        Write-Log "Actualizando archivos de aplicación del backend"
+        foreach ($relativePath in $installedSnapshot.Keys) {
+            if (-not $sourceSnapshot.ContainsKey($relativePath)) {
+                $deletedFile = Join-Path $Backend $relativePath
+                Write-Log "Eliminando archivo de aplicación obsoleto: $relativePath"
+                Remove-Item -LiteralPath $deletedFile -Force -ErrorAction Stop
+            }
+        }
+
+        Get-ChildItem $BackendSource -Force | Where-Object {
+            $_.Name -ne ".env" -and $_.Name -ne "data" -and $_.Name -ne "logs" -and $_.Name -ne "node_modules"
+        } | ForEach-Object {
+            Copy-Item $_.FullName (Join-Path $Backend $_.Name) -Recurse -Force
+        }
+    }
+    else {
+        Write-Log "Backend: SIN CAMBIOS"
+        Write-Log "Backend sin cambios: no se detiene el servicio"
+    }
 }
 
 if (-not (Test-Path "$Backend\index.js")) {
@@ -573,6 +633,7 @@ New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 # =========================================================
 
+if ($BackendChanged) {
 Set-Location $Backend
 
 $env:COMSPEC = "C:\Windows\System32\cmd.exe"
@@ -656,6 +717,13 @@ Stop-Installer 65 "La versión de oracledb instalada no corresponde a la requerid
 }
 
 Write-Log "oracledb ${OracleDbVersion}: OK"
+Write-Log "npm ejecutado por cambio de backend"
+Write-Log "oracledb configurado por cambio de backend"
+}
+else {
+Write-Log "Backend sin cambios: no se ejecuta npm"
+Write-Log "Backend sin cambios: no se modifica oracledb"
+}
 
 # =========================================================
 
@@ -694,6 +762,8 @@ Write-Log "NSSM ya existe: NO SE MODIFICA"
 # =========================================================
 
 $svc = Get-Service $ServiceName -ErrorAction SilentlyContinue
+$ServiceNeedsStart = $false
+$ServiceWasCreated = $false
 
 if (-not $svc) {
 
@@ -719,19 +789,21 @@ if ($LASTEXITCODE -ne 0) {
 & $NssmExe set $ServiceName Start SERVICE_AUTO_START
 
 Write-Log "Servicio NSSM creado"
+$ServiceNeedsStart = $true
+$ServiceWasCreated = $true
 
 }
 else {
 
 Write-Log "Servicio $ServiceName ya existe"
-
 Write-Log "Servicio existente conservado; no se elimina ni recrea"
 
-# Asegurar configuración importante
-& $NssmExe set $ServiceName AppDirectory $Backend
-& $NssmExe set $ServiceName AppStdout "$LogDir\out.log"
-& $NssmExe set $ServiceName AppStderr "$LogDir\err.log"
-& $NssmExe set $ServiceName Start SERVICE_AUTO_START
+if (-not $BackendChanged) {
+    Write-Log "Servicio no detenido"
+}
+else {
+    Write-Log "Servicio existente: configuración NSSM conservada"
+}
 
 }
 
@@ -741,11 +813,15 @@ Write-Log "Servicio existente conservado; no se elimina ni recrea"
 
 # =========================================================
 
-Write-Log "Iniciando servicio $ServiceName"
-
-& $NssmExe start $ServiceName
-
-Start-Sleep -Seconds 5
+if ($ServiceWasCreated -or ($BackendChanged -and $ServiceInitialStatus -eq "Running")) {
+    $ServiceNeedsStart = $true
+    Write-Log "Iniciando servicio $ServiceName"
+    & $NssmExe start $ServiceName
+    Start-Sleep -Seconds 5
+}
+else {
+    Write-Log "Servicio conserva su estado inicial: $ServiceInitialStatus"
+}
 
 $svcCheck = Get-Service $ServiceName -ErrorAction SilentlyContinue
 
@@ -755,8 +831,16 @@ Stop-Installer 81 "El servicio $ServiceName no existe después de la instalación.
 
 Write-Log "Estado servicio: $($svcCheck.Status)"
 
-if ($svcCheck.Status -ne "Running") {
-Stop-Installer 82 "El servicio $ServiceName no quedó en estado Running."
+if ($ServiceWasCreated -or $ServiceInitialStatus -eq "Running") {
+    if ($svcCheck.Status -ne "Running") {
+        Stop-Installer 82 "El servicio $ServiceName no quedó en estado Running."
+    }
+}
+elseif ($ServiceInitialStatus -eq "Stopped") {
+    if ($svcCheck.Status -ne "Stopped") {
+        Stop-Installer 82 "El servicio $ServiceName no conservó el estado Stopped."
+    }
+    Write-Log "Servicio sin cambios: se conserva estado Stopped"
 }
 
 Write-Log "Servicio ${ServiceName}: OK"
@@ -915,9 +999,22 @@ Stop-Installer 105 "Validación final: falta frontend."
 
 $finalSvc = Get-Service $ServiceName -ErrorAction SilentlyContinue
 
-if (-not $finalSvc -or $finalSvc.Status -ne "Running") {
-Stop-Installer 106 "Validación final: servicio no está Running."
+if (-not $finalSvc) {
+Stop-Installer 106 "Validación final: servicio no existe."
 }
+
+if ($ServiceWasCreated -or $ServiceInitialStatus -eq "Running") {
+    if ($finalSvc.Status -ne "Running") {
+        Stop-Installer 106 "Validación final: servicio no quedó Running."
+    }
+}
+elseif ($ServiceInitialStatus -eq "Stopped") {
+    if ($finalSvc.Status -ne "Stopped") {
+        Stop-Installer 106 "Validación final: servicio no conservó estado Stopped."
+    }
+}
+
+Write-Log "Validación final servicio: $($finalSvc.Status)"
 
 $finalSite = & $appcmd list site "impresionEtiquetas" 2>$null
 
@@ -930,12 +1027,14 @@ Write-Log "npm: OK"
 Write-Log "Backend: OK"
 Write-Log "Oracle Instant Client: OK"
 Write-Log "NSSM: OK"
-Write-Log "Servicio MiBackendNode: Running"
+Write-Log "Servicio MiBackendNode: $($finalSvc.Status)"
 Write-Log "Frontend: OK"
 Write-Log "IIS impresionEtiquetas: OK"
 
 Write-Log "=========================================="
 Write-Log "INSTALACION FINALIZADA CORRECTAMENTE"
+$elapsed = (Get-Date) - $InstallerStart
+Write-Log "DURACION TOTAL: $($elapsed.ToString('hh\:mm\:ss'))"
 Write-Log "=========================================="
 
 if ($TranscriptEnabled) {
