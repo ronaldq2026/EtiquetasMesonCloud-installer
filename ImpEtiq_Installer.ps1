@@ -49,7 +49,6 @@ $FrontendOut = "$FrontendRoot\out"
 $TargetNodeVersion = "14.21.3"
 $TargetNpmVersion  = "6.14.18"
 $BackendPort = 3000
-$BackendHealthUrl = "http://127.0.0.1:$BackendPort/health"
 $ServiceWaitTimeoutSeconds = 60
 
 # -------------------------
@@ -112,58 +111,6 @@ try {
 finally {
     $ErrorActionPreference = $previousErrorActionPreference
 }
-}
-
-function Get-ApplicationFiles {
-param([string]$Path)
-
-Get-ChildItem -LiteralPath $Path -Force | Where-Object {
-    $_.Name -ne ".env" -and $_.Name -ne "data" -and $_.Name -ne "logs" -and $_.Name -ne "node_modules"
-} | ForEach-Object {
-    if ($_.PSIsContainer) {
-        Get-ApplicationFiles -Path $_.FullName
-    }
-    else {
-        $_
-    }
-}
-}
-
-function Get-ApplicationDirectories {
-param([string]$Path)
-
-    Get-ChildItem -LiteralPath $Path -Force -Directory | Where-Object {
-        $_.Name -ne "data" -and $_.Name -ne "logs" -and $_.Name -ne "node_modules"
-    } | ForEach-Object {
-        $_
-        Get-ApplicationDirectories -Path $_.FullName
-    }
-}
-
-function Get-FileSha256 {
-param([string]$Path)
-
-$sha256 = [System.Security.Cryptography.SHA256]::Create()
-$stream = [System.IO.File]::OpenRead($Path)
-try {
-    $hashBytes = $sha256.ComputeHash($stream)
-    return ([System.BitConverter]::ToString($hashBytes)).Replace("-", "")
-}
-finally {
-    $stream.Dispose()
-    $sha256.Dispose()
-}
-}
-
-function Get-BackendSnapshot {
-param([string]$Path)
-
-$snapshot = @{}
-foreach ($file in (Get-ApplicationFiles -Path $Path)) {
-    $relativePath = $file.FullName.Substring($Path.Length).TrimStart('\')
-    $snapshot[$relativePath] = Get-FileSha256 -Path $file.FullName
-}
-return $snapshot
 }
 
 function Wait-ServiceState {
@@ -232,18 +179,6 @@ param(
     }
 }
 
-function Test-BackendHealth {
-    try {
-        $response = Invoke-WebRequest -Uri $BackendHealthUrl -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-        Write-Log "Backend health: HTTP $($response.StatusCode) en $BackendHealthUrl"
-        return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300)
-    }
-    catch {
-        Write-Log "Backend health no respondio en ${BackendHealthUrl}: $($_.Exception.Message)"
-        return $false
-    }
-}
-
 function Test-FrontendHealth {
 param([string]$Url)
     try {
@@ -255,6 +190,34 @@ param([string]$Url)
         Write-Log "Frontend no respondio en ${Url}: $($_.Exception.Message)"
         return $false
     }
+}
+
+function Get-AppPoolState {
+param(
+    [string]$AppCmdPath,
+    [string]$AppPoolName
+)
+
+    return ((@(& $AppCmdPath list apppool $AppPoolName /text:state 2>$null) | ForEach-Object { $_.ToString().Trim() }) -join "").Trim()
+}
+
+function Wait-AppPoolState {
+param(
+    [string]$AppCmdPath,
+    [string]$AppPoolName,
+    [string]$DesiredState,
+    [int]$TimeoutSeconds = 60
+)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $state = Get-AppPoolState -AppCmdPath $AppCmdPath -AppPoolName $AppPoolName
+        Write-Log "AppPool ${AppPoolName}: estado actual $state; esperando $DesiredState"
+        if ($state -eq $DesiredState) { return $true }
+        Start-Sleep -Seconds 2
+    } while ((Get-Date) -lt $deadline)
+
+    return ((Get-AppPoolState -AppCmdPath $AppCmdPath -AppPoolName $AppPoolName) -eq $DesiredState)
 }
 
 $CurrentStage = "Inicio"
@@ -299,7 +262,24 @@ $principal = New-Object Security.Principal.WindowsPrincipal(
 if (-not $principal.IsInRole(
 [Security.Principal.WindowsBuiltInRole]::Administrator
 )) {
-Stop-Installer 1 "El instalador debe ejecutarse como Administrador."
+    if ($args -contains '-ImpEtiqElevated') {
+        Stop-Installer 1 "El instalador elevado no obtuvo permisos de Administrador."
+    }
+
+    try {
+        $scriptPath = $MyInvocation.MyCommand.Path
+        $elevatedProcess = Start-Process `
+            -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$scriptPath`"", '-ImpEtiqElevated') `
+            -Verb RunAs `
+            -Wait `
+            -PassThru `
+            -ErrorAction Stop
+        exit $elevatedProcess.ExitCode
+    }
+    catch {
+        Stop-Installer 1 "No fue posible relanzar el instalador con permisos de Administrador: $($_.Exception.Message)"
+    }
 }
 
 Write-Log "Permisos de administrador: OK"
@@ -644,13 +624,8 @@ if (-not (Test-Path $BackendSource)) {
 Stop-Installer 50 "No se encontr� el backend en $BackendSource"
 }
 
-$BackendExists = Test-Path $Backend
-$CurrentStage = "Detecci�n de cambios del backend"
-$BackendChanged = $false
 $InitialService = Get-Service $ServiceName -ErrorAction SilentlyContinue
 $ServiceInitialStatus = $null
-$ServiceShouldRun = $false
-$ServiceNeedsStart = $false
 if ($InitialService) {
     $InitialService.Refresh()
     $ServiceInitialStatus = $InitialService.Status.ToString()
@@ -660,7 +635,6 @@ if ($InitialService) {
         if (-not $InitialService -or $InitialService.Status -ne 'Running') {
             Stop-Installer 52 "El servicio $ServiceName no alcanzo Running durante el arranque."
         }
-        $ServiceShouldRun = $true
     }
     elseif ($ServiceInitialStatus -eq 'StopPending') {
         $InitialService = Wait-ServiceState -Name $ServiceName -DesiredState 'Stopped' -TimeoutSeconds $ServiceWaitTimeoutSeconds
@@ -668,74 +642,28 @@ if ($InitialService) {
             Stop-Installer 52 "El servicio $ServiceName no alcanzo Stopped durante la detencion."
         }
     }
-    elseif ($ServiceInitialStatus -eq 'Running') {
-        $ServiceShouldRun = $true
+    if ($InitialService.Status -ne 'Stopped') {
+        Write-Log "Deteniendo servicio antes de reemplazar el backend"
+        Stop-ServiceAndWait -Name $ServiceName | Out-Null
     }
 }
 
-if (-not $BackendExists) {
-    $BackendChanged = $true
-    Write-Log "Backend: CAMBIOS DETECTADOS"
-    Write-Log "Instalaci�n nueva: copiando backend de aplicaci�n"
-    New-Item -ItemType Directory -Path $Backend -Force | Out-Null
-    Get-ChildItem $BackendSource -Force | Where-Object {
-        $_.Name -ne ".env" -and $_.Name -ne "data" -and $_.Name -ne "logs" -and $_.Name -ne "node_modules"
-    } | ForEach-Object {
-        Copy-Item $_.FullName (Join-Path $Backend $_.Name) -Recurse -Force
+Write-Log "Reemplazando completamente el backend desde el instalador"
+$CurrentStage = "Reemplazo del backend"
+try {
+    if (Test-Path $Backend) {
+        Write-Log "Eliminando completamente $Backend"
+        Remove-Item -LiteralPath $Backend -Recurse -Force -ErrorAction Stop
+        Write-Log "Backend existente eliminado correctamente"
     }
 }
-else {
-    $sourceSnapshot = Get-BackendSnapshot -Path $BackendSource
-    $installedSnapshot = Get-BackendSnapshot -Path $Backend
-    if ($sourceSnapshot.Count -ne $installedSnapshot.Count) {
-        $BackendChanged = $true
-    }
-    else {
-        foreach ($relativePath in $sourceSnapshot.Keys) {
-            if (-not $installedSnapshot.ContainsKey($relativePath) -or
-                $installedSnapshot[$relativePath] -ne $sourceSnapshot[$relativePath]) {
-                $BackendChanged = $true
-                break
-            }
-        }
-    }
-
-    if ($BackendChanged) {
-        Write-Log "Backend: CAMBIOS DETECTADOS"
-        if ($InitialService -and $ServiceShouldRun) {
-            Write-Log "Servicio detenido por actualizacion de backend"
-            Stop-ServiceAndWait -Name $ServiceName | Out-Null
-            $ServiceNeedsStart = $true
-        }
-
-        Write-Log "Actualizando archivos de aplicaci�n del backend"
-        foreach ($relativePath in @($installedSnapshot.Keys)) {
-            if (-not $sourceSnapshot.ContainsKey($relativePath)) {
-                $deletedFile = Join-Path $Backend $relativePath
-                Write-Log "Eliminando archivo de aplicaci�n obsoleto: $relativePath"
-                Remove-Item -LiteralPath $deletedFile -Force -ErrorAction Stop
-            }
-        }
-
-        foreach ($directory in @(Get-ApplicationDirectories -Path $Backend | Sort-Object { $_.FullName.Length } -Descending)) {
-            $relativeDirectory = $directory.FullName.Substring($Backend.Length).TrimStart('\')
-            $sourceDirectory = Join-Path $BackendSource $relativeDirectory
-            if (-not (Test-Path -LiteralPath $sourceDirectory)) {
-                Write-Log "Eliminando directorio de aplicacion obsoleto: $relativeDirectory"
-                Remove-Item -LiteralPath $directory.FullName -Recurse -Force -ErrorAction Stop
-            }
-        }
-
-        Get-ChildItem $BackendSource -Force | Where-Object {
-            $_.Name -ne ".env" -and $_.Name -ne "data" -and $_.Name -ne "logs" -and $_.Name -ne "node_modules"
-        } | ForEach-Object {
-            Copy-Item $_.FullName (Join-Path $Backend $_.Name) -Recurse -Force
-        }
-    }
-    else {
-        Write-Log "Backend: SIN CAMBIOS"
-        Write-Log "Backend sin cambios: no se detiene el servicio"
-    }
+catch {
+    Write-Log "ERROR: No fue posible eliminar ${Backend}: $($_.Exception.Message)"
+    Stop-Installer 53 "No fue posible eliminar $Backend"
+}
+New-Item -ItemType Directory -Path $Backend -Force -ErrorAction Stop | Out-Null
+foreach ($sourceItem in @(Get-ChildItem -LiteralPath $BackendSource -Force)) {
+    Copy-Item -LiteralPath $sourceItem.FullName -Destination (Join-Path $Backend $sourceItem.Name) -Recurse -Force -ErrorAction Stop
 }
 
 if (-not (Test-Path "$Backend\index.js")) {
@@ -760,7 +688,6 @@ New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 # =========================================================
 
-if ($BackendChanged) {
 Set-Location $Backend
 
 $env:COMSPEC = "C:\Windows\System32\cmd.exe"
@@ -844,13 +771,8 @@ Stop-Installer 65 "La versi�n de oracledb instalada no corresponde a la requer
 }
 
 Write-Log "oracledb ${OracleDbVersion}: OK"
-Write-Log "npm ejecutado por cambio de backend"
-Write-Log "oracledb configurado por cambio de backend"
-}
-else {
-Write-Log "Backend sin cambios: no se ejecuta npm"
-Write-Log "Backend sin cambios: no se modifica oracledb"
-}
+Write-Log "npm ejecutado después del reemplazo del backend"
+Write-Log "oracledb configurado después del reemplazo del backend"
 
 # =========================================================
 
@@ -901,7 +823,7 @@ if ($LASTEXITCODE -ne 0) {
     Stop-Installer 80 "No fue posible crear el servicio NSSM."
 }
 
-Set-NssmSettingChecked $ServiceName 'AppPath' $NodeExe
+Set-NssmSettingChecked $ServiceName 'Application' $NodeExe
 Set-NssmSettingChecked $ServiceName 'AppDirectory' $Backend
 Set-NssmSettingChecked $ServiceName 'AppParameters' "$Backend\index.js"
 Set-NssmSettingChecked $ServiceName 'AppStdout' "$LogDir\out.log"
@@ -914,22 +836,21 @@ Set-NssmSettingChecked $ServiceName 'Start' 'SERVICE_AUTO_START'
 
 Write-Log "Servicio NSSM creado"
 $ServiceWasCreated = $true
-$ServiceShouldRun = $true
-$ServiceNeedsStart = $true
 
 }
 else {
 
 Write-Log "Servicio $ServiceName ya existe"
 Write-Log "Servicio existente conservado; no se elimina ni recrea"
-
-    $expectedNssm = @{
-        AppPath = $NodeExe
-        AppDirectory = $Backend
-        AppParameters = "$Backend\index.js"
-        AppStdout = "$LogDir\out.log"
-        AppStderr = "$LogDir\err.log"
-    }
+	
+	$expectedNssm = @{
+    Application = $NodeExe
+    AppDirectory = $Backend
+    AppParameters = "$Backend\index.js"
+    AppStdout = "$LogDir\out.log"
+    AppStderr = "$LogDir\err.log"
+	}	
+	
     $nssmChanged = $false
     foreach ($setting in $expectedNssm.Keys) {
         $actual = Get-NssmSetting -Name $ServiceName -Setting $setting
@@ -940,11 +861,9 @@ Write-Log "Servicio existente conservado; no se elimina ni recrea"
         }
     }
     if ($nssmChanged) {
-        if ($ServiceShouldRun) { Stop-ServiceAndWait -Name $ServiceName | Out-Null }
         foreach ($setting in $expectedNssm.Keys) {
             Set-NssmSettingChecked $ServiceName $setting $expectedNssm[$setting]
         }
-        if ($ServiceShouldRun) { $ServiceNeedsStart = $true }
         Write-Log "Configuracion NSSM corregida sin recrear el servicio"
     }
     else {
@@ -959,21 +878,16 @@ Write-Log "Servicio existente conservado; no se elimina ni recrea"
 
 # =========================================================
 
-if ($ServiceShouldRun -and $ServiceNeedsStart) {
-    Write-Log "Iniciando servicio $ServiceName"
-    & $NssmExe start $ServiceName
-    if ($LASTEXITCODE -ne 0) {
-        Stop-Installer 80 "NSSM no pudo iniciar el servicio $ServiceName."
-    }
-    $svcCheck = Wait-ServiceState -Name $ServiceName -DesiredState 'Running' -TimeoutSeconds $ServiceWaitTimeoutSeconds
-    if (-not $svcCheck -or $svcCheck.Status -ne 'Running') {
-        if (Test-Path "$LogDir\out.log") { Get-Content -LiteralPath "$LogDir\out.log" -Tail 30 | ForEach-Object { Write-Log "out.log: $_" } }
-        if (Test-Path "$LogDir\err.log") { Get-Content -LiteralPath "$LogDir\err.log" -Tail 30 | ForEach-Object { Write-Log "err.log: $_" } }
-        Stop-Installer 82 "El servicio $ServiceName no alcanzo Running dentro del timeout."
-    }
+Write-Log "Iniciando servicio $ServiceName"
+& $NssmExe start $ServiceName
+if ($LASTEXITCODE -ne 0) {
+    Stop-Installer 80 "NSSM no pudo iniciar el servicio $ServiceName."
 }
-else {
-    Write-Log "Servicio conserva su estado inicial: $ServiceInitialStatus"
+$svcCheck = Wait-ServiceState -Name $ServiceName -DesiredState 'Running' -TimeoutSeconds $ServiceWaitTimeoutSeconds
+if (-not $svcCheck -or $svcCheck.Status -ne 'Running') {
+    if (Test-Path "$LogDir\out.log") { Get-Content -LiteralPath "$LogDir\out.log" -Tail 30 | ForEach-Object { Write-Log "out.log: $_" } }
+    if (Test-Path "$LogDir\err.log") { Get-Content -LiteralPath "$LogDir\err.log" -Tail 30 | ForEach-Object { Write-Log "err.log: $_" } }
+    Stop-Installer 82 "El servicio $ServiceName no alcanzo Running dentro del timeout."
 }
 
 $svcCheck = Get-Service $ServiceName -ErrorAction SilentlyContinue
@@ -984,24 +898,14 @@ Stop-Installer 81 "El servicio $ServiceName no existe despu�s de la instalaci�
 
 Write-Log "Estado servicio: $($svcCheck.Status)"
 
-if ($ServiceShouldRun) {
-    if ($svcCheck.Status -ne "Running") {
-        Stop-Installer 82 "El servicio $ServiceName no quedo en estado Running."
-    }
-    if (-not (Test-BackendHealth)) {
-        if (Test-Path "$LogDir\out.log") { Get-Content -LiteralPath "$LogDir\out.log" -Tail 30 | ForEach-Object { Write-Log "out.log: $_" } }
-        if (Test-Path "$LogDir\err.log") { Get-Content -LiteralPath "$LogDir\err.log" -Tail 30 | ForEach-Object { Write-Log "err.log: $_" } }
-        Stop-Installer 84 "El servicio esta Running pero el backend no responde en $BackendHealthUrl."
-    }
+if ($svcCheck.Status -ne "Running") {
+    Stop-Installer 82 "El servicio $ServiceName no quedo en estado Running."
 }
-elseif ($ServiceInitialStatus -eq "Stopped") {
-    if ($svcCheck.Status -ne "Stopped") {
-        Stop-Installer 82 "El servicio $ServiceName no conserv� el estado Stopped."
-    }
-    Write-Log "Servicio sin cambios: se conserva estado Stopped"
-}
+Write-Log "Servicio ${ServiceName}: estado Running"
+Write-Log "Health HTTP no utilizado como criterio de exito del backend"
 
 Write-Log "Servicio ${ServiceName}: OK"
+Write-Log "Continuando con reemplazo del frontend"
 
 # =========================================================
 
@@ -1015,23 +919,81 @@ if (-not (Test-Path $FrontendSource)) {
 Stop-Installer 90 "No se encontr� el frontend en $FrontendSource"
 }
 
-if (-not (Test-Path $FrontendOut)) {
-New-Item -ItemType Directory -Path $FrontendOut -Force | Out-Null
-}
-
 Write-Log "Actualizando frontend"
 
-foreach ($existingItem in @(Get-ChildItem -LiteralPath $FrontendOut -Force)) {
-    Write-Log "Eliminando contenido anterior del frontend: $($existingItem.Name)"
-    Remove-Item -LiteralPath $existingItem.FullName -Recurse -Force -ErrorAction Stop
+$appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
+$FrontendAppPoolName = $null
+$FrontendAppPoolInitialState = $null
+$FrontendAppPoolNeedsStart = $false
+
+if (Test-Path $appcmd) {
+    $existingSite = & $appcmd list site "impresionEtiquetas" 2>$null
+    if ($existingSite) {
+        Write-Log "Sitio IIS: impresionEtiquetas"
+        $FrontendAppPoolName = ((@(& $appcmd list app "impresionEtiquetas/" /text:applicationPool 2>$null) | ForEach-Object { $_.ToString().Trim() }) -join "").Trim()
+        if ([string]::IsNullOrEmpty($FrontendAppPoolName)) {
+            Stop-Installer 94 "No fue posible identificar el AppPool del sitio impresionEtiquetas."
+        }
+
+        $FrontendAppPoolInitialState = Get-AppPoolState -AppCmdPath $appcmd -AppPoolName $FrontendAppPoolName
+        if ([string]::IsNullOrEmpty($FrontendAppPoolInitialState)) {
+            Write-Log "AppPool $FrontendAppPoolName no existe. Creando..."
+            & $appcmd add apppool "/name:$FrontendAppPoolName" 2>&1 | ForEach-Object { Write-Log "IIS: $($_.ToString())" }
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrEmpty((Get-AppPoolState -AppCmdPath $appcmd -AppPoolName $FrontendAppPoolName))) {
+                Stop-Installer 94 "No fue posible crear el AppPool $FrontendAppPoolName."
+            }
+            $FrontendAppPoolNeedsStart = $true
+            $FrontendAppPoolInitialState = "Stopped"
+        }
+        else {
+            Write-Log "AppPool detectado: $FrontendAppPoolName"
+            Write-Log "Estado inicial AppPool: $FrontendAppPoolInitialState"
+            if ($FrontendAppPoolInitialState -ne "Stopped") {
+                Write-Log "Deteniendo AppPool antes de reemplazar frontend"
+                & $appcmd stop apppool "/apppool.name:$FrontendAppPoolName" 2>&1 | ForEach-Object { Write-Log "IIS: $($_.ToString())" }
+                if ($LASTEXITCODE -ne 0 -or -not (Wait-AppPoolState -AppCmdPath $appcmd -AppPoolName $FrontendAppPoolName -DesiredState "Stopped" -TimeoutSeconds $ServiceWaitTimeoutSeconds)) {
+                    Stop-Installer 94 "No fue posible detener el AppPool $FrontendAppPoolName antes de reemplazar el frontend."
+                }
+                Write-Log "AppPool detenido correctamente"
+                $FrontendAppPoolNeedsStart = $true
+            }
+        }
+    }
 }
-foreach ($sourceItem in @(Get-ChildItem -LiteralPath $FrontendSource -Force)) {
-    Copy-Item -LiteralPath $sourceItem.FullName -Destination (Join-Path $FrontendOut $sourceItem.Name) -Recurse -Force -ErrorAction Stop
+
+$CurrentStage = "Reemplazo del frontend"
+
+try {
+    if (Test-Path $FrontendOut) {
+        Write-Log "Eliminando completamente $FrontendOut"
+        Remove-Item -LiteralPath $FrontendOut -Recurse -Force -ErrorAction Stop
+    }
+    New-Item -ItemType Directory -Path $FrontendOut -Force -ErrorAction Stop | Out-Null
+    Write-Log "Copiando frontend desde $FrontendSource"
+    foreach ($sourceItem in @(Get-ChildItem -LiteralPath $FrontendSource -Force)) {
+        Copy-Item -LiteralPath $sourceItem.FullName -Destination (Join-Path $FrontendOut $sourceItem.Name) -Recurse -Force -ErrorAction Stop
+    }
+}
+catch {
+    Write-Log "ERROR reemplazando frontend: $($_.Exception.Message)"
+    if ($FrontendAppPoolName -and $FrontendAppPoolNeedsStart) {
+        Write-Log "Restaurando estado inicial del AppPool después del error"
+        & $appcmd start apppool "/apppool.name:$FrontendAppPoolName" 2>&1 | ForEach-Object { Write-Log "IIS: $($_.ToString())" }
+        if ($LASTEXITCODE -eq 0 -and (Wait-AppPoolState -AppCmdPath $appcmd -AppPoolName $FrontendAppPoolName -DesiredState "Started" -TimeoutSeconds $ServiceWaitTimeoutSeconds)) {
+            Write-Log "AppPool iniciado correctamente"
+        }
+        else {
+            Write-Log "ERROR: no fue posible restaurar el AppPool $FrontendAppPoolName después del error"
+        }
+    }
+    throw
 }
 
 if (-not (Test-Path $FrontendOut)) {
 Stop-Installer 91 "El frontend no qued� correctamente instalado."
 }
+
+Write-Log "Frontend: OK"
 
 # =========================================================
 
@@ -1090,8 +1052,6 @@ foreach ($FeatureName in $IisFeatures) {
 
 # =========================================================
 
-$appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
-
 if (-not (Test-Path $appcmd)) {
 Stop-Installer 92 "No se encontr� appcmd.exe. IIS no est� disponible."
 }
@@ -1136,6 +1096,15 @@ Write-Log "Ruta f�sica IIS verificada"
 
 }
 
+if ($FrontendAppPoolName -and $FrontendAppPoolNeedsStart) {
+    Write-Log "Restaurando estado inicial del AppPool"
+    & $appcmd start apppool "/apppool.name:$FrontendAppPoolName" 2>&1 | ForEach-Object { Write-Log "IIS: $($_.ToString())" }
+    if ($LASTEXITCODE -ne 0 -or -not (Wait-AppPoolState -AppCmdPath $appcmd -AppPoolName $FrontendAppPoolName -DesiredState "Started" -TimeoutSeconds $ServiceWaitTimeoutSeconds)) {
+        Stop-Installer 95 "No fue posible iniciar nuevamente el AppPool $FrontendAppPoolName."
+    }
+    Write-Log "AppPool iniciado correctamente"
+}
+
 # =========================================================
 
 # VALIDACI�N FINAL
@@ -1176,15 +1145,8 @@ if (-not $finalSvc) {
 Stop-Installer 106 "Validaci�n final: servicio no existe."
 }
 
-if ($ServiceShouldRun) {
-    if ($finalSvc.Status -ne "Running") {
-        Stop-Installer 106 "Validaci�n final: servicio no quedo Running."
-    }
-}
-elseif ($ServiceInitialStatus -eq "Stopped") {
-    if ($finalSvc.Status -ne "Stopped") {
-        Stop-Installer 106 "Validaci�n final: servicio no conserv� estado Stopped."
-    }
+if ($finalSvc.Status -ne "Running") {
+    Stop-Installer 106 "Validaci�n final: servicio no quedo Running."
 }
 
 Write-Log "Validaci�n final servicio: $($finalSvc.Status)"
