@@ -31,15 +31,15 @@ $BaseDir = [System.IO.Path]::GetDirectoryName(
 # Variables base
 
 # -------------------------
-
-$LogFile  = "C:\impetiq_install.log"
+$Hostname = $env:COMPUTERNAME
+$LogFile = "C:\impetiq_install_$Hostname.log"
 $InstallerStart = Get-Date
-$NodeDir  = "C:\Program Files\nodejs"
-$NodeExe  = "$NodeDir\node.exe"
-$NpmCmd   = "$NodeDir\npm.cmd"
-$Backend  = "C:\backend-dbf"
+$NodeDir = "C:\Program Files\nodejs"
+$NodeExe = "$NodeDir\node.exe"
+$NpmCmd = "$NodeDir\npm.cmd"
+$Backend = "C:\backend-dbf"
 $OracleIC = "C:\oracle\instantclient_19_30"
-$NssmExe  = "C:\nssm\win64\nssm.exe"
+$NssmExe = "C:\nssm\win64\nssm.exe"
 
 $ServiceName = "MiBackendNode"
 $FrontendRoot = "C:\frontend-etiquetas"
@@ -878,15 +878,22 @@ Write-Log "Servicio existente conservado; no se elimina ni recrea"
 
 # =========================================================
 
+if ($ServiceWasCreated) {
+    Write-Log "Esperando 15 segundos antes del primer arranque del servicio $ServiceName"
+    Start-Sleep -Seconds 15
+}
+
 Write-Log "Iniciando servicio $ServiceName"
 & $NssmExe start $ServiceName
 if ($LASTEXITCODE -ne 0) {
-    Stop-Installer 80 "NSSM no pudo iniciar el servicio $ServiceName."
+    Write-Log "ADVERTENCIA: NSSM devolvio codigo $LASTEXITCODE al iniciar el servicio $ServiceName; se validara el estado real del servicio."
 }
 $svcCheck = Wait-ServiceState -Name $ServiceName -DesiredState 'Running' -TimeoutSeconds $ServiceWaitTimeoutSeconds
 if (-not $svcCheck -or $svcCheck.Status -ne 'Running') {
     if (Test-Path "$LogDir\out.log") { Get-Content -LiteralPath "$LogDir\out.log" -Tail 30 | ForEach-Object { Write-Log "out.log: $_" } }
     if (Test-Path "$LogDir\err.log") { Get-Content -LiteralPath "$LogDir\err.log" -Tail 30 | ForEach-Object { Write-Log "err.log: $_" } }
+    $failedServiceState = if ($svcCheck) { $svcCheck.Status } else { 'No encontrado' }
+    Write-Log "Estado servicio: $failedServiceState"
     Stop-Installer 82 "El servicio $ServiceName no alcanzo Running dentro del timeout."
 }
 
