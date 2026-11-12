@@ -71,6 +71,19 @@ catch {
 
 }
 
+# Desbloquear los archivos entregados con el instalador. Esto evita que
+# SmartScreen/Mark-of-the-Web bloquee MSU, MSI, EXE o DLL del paquete.
+try {
+    $packageFiles = @(Get-ChildItem -LiteralPath $BaseDir -File -Recurse -Force -ErrorAction SilentlyContinue)
+    foreach ($packageFile in $packageFiles) {
+        Unblock-File -LiteralPath $packageFile.FullName -ErrorAction SilentlyContinue
+    }
+    Write-Log "Archivos del paquete revisados para desbloqueo: $($packageFiles.Count)"
+}
+catch {
+    Write-Log "Aviso: no fue posible revisar todos los archivos para desbloqueo: $($_.Exception.Message)"
+}
+
 function Stop-Installer {
 param(
 [int]$ExitCode,
@@ -223,7 +236,7 @@ param(
 $CurrentStage = "Inicio"
 trap {
     $unexpectedMessage = $_.Exception.Message
-    Write-Log "ERROR: Excepci�n inesperada en etapa [$CurrentStage]: $unexpectedMessage"
+    Write-Log "ERROR: Excepcion inesperada en etapa [$CurrentStage]: $unexpectedMessage"
     if ($InstallerStart) {
         $unexpectedElapsed = (Get-Date) - $InstallerStart
         Write-Log "DURACION TOTAL: $($unexpectedElapsed.ToString('hh\:mm\:ss'))"
@@ -331,71 +344,93 @@ $OracleDbVersion = "6.10.0"
 Write-Log "oracledb requerido: $OracleDbVersion"
 
 # =========================================================
-
 # SERVER 2012 - PREREQUISITOS
-
 # =========================================================
 
 if ($isServer2012) {
 
-Write-Log "Validando prerrequisitos de Windows Server 2012"
+    Write-Log "Validando prerrequisitos de Windows Server 2012"
 
-# -------------------------
-# KB2999226
-# -------------------------
-$kb = Get-HotFix -Id KB2999226 -ErrorAction SilentlyContinue
+    # -------------------------
+    # KB2999226
+    # -------------------------
+    $kb = Get-HotFix -Id KB2999226 -ErrorAction SilentlyContinue
 
-if (-not $kb) {
+    if (-not $kb) {
 
-    if ($version -like "6.2*") {
-        $KbFile = "$BaseDir\Windows8-RT-KB2999226-x64.msu"
-    }
-    elseif ($version -like "6.3*") {
-        $KbFile = "$BaseDir\Windows8.1-KB2999226-x64.msu"
-    }
-    else {
-        Stop-Installer 20 "No existe un paquete KB2999226 definido para la versi�n de Windows: $version"
-    }
+        # Solo se modifica la configuracion de estos servicios cuando realmente
+        # se va a instalar el KB y un servicio esta Disabled (error 1058).
+        foreach ($svcName in @("wuauserv", "TrustedInstaller")) {
+            $svcObj = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svcObj) {
+                $svcConfig = Get-CimInstance Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
+                if ($svcConfig -and $svcConfig.StartMode -eq 'Disabled') {
+                    Write-Log "Servicio $svcName esta Disabled. Configurando temporalmente como Manual para instalar KB2999226..."
+                    & sc.exe config $svcName start demand 2>&1 | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        Stop-Installer 20 "No fue posible habilitar temporalmente el servicio $svcName."
+                    }
+                    $svcObj.Refresh()
+                    if ($svcObj.Status -ne 'Running') {
+                        Write-Log "Iniciando servicio $svcName para instalar KB2999226..."
+                        & sc.exe start $svcName 2>&1 | Out-Null
+                        Start-Sleep -Seconds 2
+                    }
+                }
+            }
+        }
 
-    if (-not (Test-Path $KbFile)) {
-        Stop-Installer 20 "No se encontr� $KbFile"
-    }
-
-    Write-Log "KB2999226 no encontrado. Instalando..."
-
-    $kbProcess = Start-Process `
-        -FilePath "wusa.exe" `
-        -ArgumentList "`"$KbFile`" /quiet /norestart" `
-        -Wait `
-        -PassThru
-
-    Write-Log "Resultado instalaci�n KB2999226: $($kbProcess.ExitCode)"
-
-    if ($kbProcess.ExitCode -ne 0 -and $kbProcess.ExitCode -ne 3010) {
-        Stop-Installer 21 "Fall� la instalaci�n de KB2999226. C�digo: $($kbProcess.ExitCode)"
-    }
-
-    $kbAfterInstall = Get-HotFix -Id KB2999226 -ErrorAction SilentlyContinue
-    if ($kbProcess.ExitCode -eq 3010) {
-        Write-Log "KB2999226 requiere reinicio; no se reiniciar� autom�ticamente."
-        if ($kbAfterInstall) {
-            Write-Log "KB2999226 confirmado despu�s de la instalaci�n."
+        if ($version -like "6.2*") {
+            $KbFile = "$BaseDir\Windows8-RT-KB2999226-x64.msu"
+        }
+        elseif ($version -like "6.3*") {
+            $KbFile = "$BaseDir\Windows8.1-KB2999226-x64.msu"
         }
         else {
-            Write-Log "KB2999226 pendiente de confirmaci�n hasta reiniciar el servidor."
+            Stop-Installer 20 "No existe un paquete KB2999226 definido para la versin de Windows: $version"
+        }
+
+        if (-not (Test-Path $KbFile)) {
+            Stop-Installer 20 "No se encontro $KbFile"
+        }
+
+        Write-Log "KB2999226 no encontrado. Instalando..."
+
+        $kbProcess = Start-Process `
+            -FilePath "wusa.exe" `
+            -ArgumentList "`"$KbFile`" /quiet /norestart" `
+            -Wait `
+            -PassThru
+
+        Write-Log "Resultado instalacion KB2999226: $($kbProcess.ExitCode)"
+
+        if ($kbProcess.ExitCode -ne 0 -and $kbProcess.ExitCode -ne 3010) {
+            Stop-Installer 21 "Fallo la instalacion de KB2999226. Codigo: $($kbProcess.ExitCode)"
+        }
+
+        $kbAfterInstall = Get-HotFix -Id KB2999226 -ErrorAction SilentlyContinue
+        if ($kbProcess.ExitCode -eq 3010) {
+            Write-Log "KB2999226 requiere reinicio; no se reiniciar automticamente."
+            if ($kbAfterInstall) {
+                Write-Log "KB2999226 confirmado despues de la instalacion."
+            }
+            else {
+                Write-Log "KB2999226 pendiente de confirmacin hasta reiniciar el servidor."
+            }
+        }
+        elseif (-not $kbAfterInstall) {
+            Stop-Installer 22 "KB2999226 no quedo confirmado despues de la instalacion."
+        }
+        else {
+            Write-Log "KB2999226 confirmado despues de la instalacion."
         }
     }
-    elseif (-not $kbAfterInstall) {
-        Stop-Installer 22 "KB2999226 no qued� confirmado despu�s de la instalaci�n."
-    }
     else {
-        Write-Log "KB2999226 confirmado despu�s de la instalaci�n."
+        Write-Log "KB2999226 ya esta instalado"
     }
-}
-else {
-    Write-Log "KB2999226 ya est� instalado"
-}
 
+
+#################################################################################################
 # -------------------------
 # Visual C++ Redistributable
 # -------------------------
@@ -435,21 +470,30 @@ if (-not $vcPresent) {
     $VcFile = "$BaseDir\VC_redist.x64.exe"
 
     if (-not (Test-Path $VcFile)) {
-        Stop-Installer 22 "No se encontr� $VcFile"
+        Stop-Installer 22 "No se encontro $VcFile"
     }
+
+    # NUEVO: Desbloquea el archivo para evitar que SmartScreen lo intercepte por proceder de internet
+    Unblock-File -Path $VcFile -ErrorAction SilentlyContinue
 
     Write-Log "Visual C++ Redistributable no encontrado. Instalando..."
 
     $vcProcess = Start-Process `
         -FilePath $VcFile `
-        -ArgumentList "/quiet /norestart" `
+        -ArgumentList "/quiet", "/norestart", "/log", "$BaseDir\vc_install.log" `
         -Wait `
         -PassThru
 
-    Write-Log "Resultado instalaci�n Visual C++: $($vcProcess.ExitCode)"
+    Write-Log "Resultado instalacion Visual C++: $($vcProcess.ExitCode)"
 
-    if ($vcProcess.ExitCode -ne 0 -and $vcProcess.ExitCode -ne 3010) {
-        Stop-Installer 23 "Fall� la instalaci�n de Visual C++. C�digo: $($vcProcess.ExitCode)"
+    if ($vcProcess.ExitCode -notin @(0, 1638, 1641, 3010)) {
+        Stop-Installer 23 "Fallo la instalacion de Visual C++. Codigo: $($vcProcess.ExitCode)"
+    }
+    elseif ($vcProcess.ExitCode -eq 1638) {
+        Write-Log "Visual C++ ya tiene una version igual o mas nueva instalada (codigo 1638)."
+    }
+    elseif ($vcProcess.ExitCode -eq 1641) {
+        Write-Log "Visual C++ inicio un reinicio (codigo 1641); no se reiniciara automaticamente."
     }
 }
 else {
@@ -467,7 +511,7 @@ else {
 $NodeNeedsInstall = $false
 
 if (-not (Test-Path $NodeExe)) {
-Write-Log "Node.js no est� instalado"
+Write-Log "Node.js no esta instalado"
 $NodeNeedsInstall = $true
 }
 else {
@@ -477,7 +521,7 @@ try {
     Write-Log "Node.js detectado: $nodeVersion"
 
     if ($nodeVersion -ne "v$TargetNodeVersion") {
-        Write-Log "Versi�n Node diferente de la requerida"
+        Write-Log "Version Node diferente de la requerida"
         $NodeNeedsInstall = $true
     }
 }
@@ -499,7 +543,7 @@ if ($NodeNeedsInstall) {
 $NodeMsi = "$BaseDir\node-v14.21.3-x64.msi"
 
 if (-not (Test-Path $NodeMsi)) {
-    Stop-Installer 30 "No se encontr� $NodeMsi"
+    Stop-Installer 30 "No se encontro $NodeMsi"
 }
 
 Write-Log "Instalando/actualizando Node.js $TargetNodeVersion"
@@ -510,10 +554,10 @@ $nodeProcess = Start-Process `
     -Wait `
     -PassThru
 
-Write-Log "Resultado instalaci�n Node.js: $($nodeProcess.ExitCode)"
+Write-Log "Resultado instalacion Node.js: $($nodeProcess.ExitCode)"
 
 if ($nodeProcess.ExitCode -ne 0 -and $nodeProcess.ExitCode -ne 3010) {
-    Stop-Installer 31 "Fall� la instalaci�n de Node.js. C�digo: $($nodeProcess.ExitCode)"
+    Stop-Installer 31 "Fallo la instalacion de Node.js. Codigo: $($nodeProcess.ExitCode)"
 }
 
 }
@@ -525,13 +569,13 @@ if ($nodeProcess.ExitCode -ne 0 -and $nodeProcess.ExitCode -ne 3010) {
 # -------------------------
 
 if (-not (Test-Path $NodeExe)) {
-Stop-Installer 32 "Node.js no qued� instalado correctamente."
+Stop-Installer 32 "Node.js no quedo instalado correctamente."
 }
 
 $nodeVersion = (& $NodeExe --version 2>&1).ToString().Trim()
 
 if ($nodeVersion -ne "v$TargetNodeVersion") {
-Stop-Installer 33 "Versi�n Node incorrecta. Esperada v$TargetNodeVersion, encontrada $nodeVersion"
+Stop-Installer 33 "Version Node incorrecta. Esperada v$TargetNodeVersion, encontrada $nodeVersion"
 }
 
 Write-Log "Node.js ${nodeVersion}: OK"
@@ -560,7 +604,7 @@ if ($npmExitCode -ne 0 -or [string]::IsNullOrEmpty($npmVersion)) {
     Stop-Installer 35 "No fue posible ejecutar npm correctamente."
 }
 if ($npmVersion -ne $TargetNpmVersion) {
-    Stop-Installer 36 "Versi�n npm incorrecta. Esperada $TargetNpmVersion, encontrada $npmVersion"
+    Stop-Installer 36 "Version npm incorrecta. Esperada $TargetNpmVersion, encontrada $npmVersion"
 }
 
 # =========================================================
@@ -579,7 +623,7 @@ else {
 $OracleSource = "$BaseDir\instantclient_19_30"
 
 if (-not (Test-Path $OracleSource)) {
-    Stop-Installer 40 "No se encontr� el Instant Client en $OracleSource"
+    Stop-Installer 40 "No se encontro el Instant Client en $OracleSource"
 }
 
 Write-Log "Oracle Instant Client no encontrado. Copiando..."
@@ -593,21 +637,21 @@ Copy-Item `
     -Force
 
 if (-not (Test-Path $OracleIC)) {
-    Stop-Installer 41 "El Oracle Instant Client no qued� instalado correctamente."
+    Stop-Installer 41 "El Oracle Instant Client no quedo instalado correctamente."
 }
 
 Write-Log "Oracle Instant Client 19.30 instalado"
 
 }
 
-# Validaci�n b�sica
+# Validacin bsica
 
 if (-not (Test-Path "$OracleIC\oci.dll")) {
-Stop-Installer 42 "No se encontr� oci.dll en el Instant Client."
+Stop-Installer 42 "No se encontro oci.dll en el Instant Client."
 }
 
 if (-not (Test-Path "$OracleIC\oraociei19.dll")) {
-Stop-Installer 43 "No se encontr� oraociei19.dll en el Instant Client."
+Stop-Installer 43 "No se encontro oraociei19.dll en el Instant Client."
 }
 
 Write-Log "Oracle Instant Client: OK"
@@ -621,7 +665,7 @@ Write-Log "Oracle Instant Client: OK"
 $BackendSource = "$BaseDir\backend-dbf"
 
 if (-not (Test-Path $BackendSource)) {
-Stop-Installer 50 "No se encontr� el backend en $BackendSource"
+Stop-Installer 50 "No se encontro el backend en $BackendSource"
 }
 
 $InitialService = Get-Service $ServiceName -ErrorAction SilentlyContinue
@@ -667,7 +711,7 @@ foreach ($sourceItem in @(Get-ChildItem -LiteralPath $BackendSource -Force)) {
 }
 
 if (-not (Test-Path "$Backend\index.js")) {
-Stop-Installer 51 "El backend no contiene index.js despu�s de la actualizaci�n."
+Stop-Installer 51 "El backend no contiene index.js despues de la actualizacion."
 }
 
 Write-Log "Backend: OK"
@@ -685,7 +729,6 @@ New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 # =========================================================
 
 # NPM / DEPENDENCIAS
-
 # =========================================================
 
 Set-Location $Backend
@@ -693,68 +736,66 @@ Set-Location $Backend
 $env:COMSPEC = "C:\Windows\System32\cmd.exe"
 $env:PATH = "$OracleIC;$NodeDir;$NodeDir\node_modules\npm\bin;$env:PATH"
 
-# Configuraci�n npm silenciosa
+# Configuracin npm silenciosa
 
 Write-Log "Configurando npm"
 
 $npmResult = Invoke-Npm "config set audit false"
 if ($npmResult.ExitCode -ne 0) {
-foreach ($line in @($npmResult.Output)) { Write-Log "npm: $($line.ToString())" }
-Stop-Installer 60 "No fue posible configurar npm audit."
+    foreach ($line in @($npmResult.Output)) { Write-Log "npm: $($line.ToString())" }
+    Stop-Installer 60 "No fue posible configurar npm audit."
 }
 
 $npmResult = Invoke-Npm "config set fund false"
 if ($npmResult.ExitCode -ne 0) {
-foreach ($line in @($npmResult.Output)) { Write-Log "npm: $($line.ToString())" }
-Stop-Installer 61 "No fue posible configurar npm fund."
+    foreach ($line in @($npmResult.Output)) { Write-Log "npm: $($line.ToString())" }
+    Stop-Installer 61 "No fue posible configurar npm fund."
 }
 
 $npmResult = Invoke-Npm "config set update-notifier false"
 if ($npmResult.ExitCode -ne 0) {
-foreach ($line in @($npmResult.Output)) { Write-Log "npm: $($line.ToString())" }
-Stop-Installer 62 "No fue posible configurar npm update-notifier."
+    foreach ($line in @($npmResult.Output)) { Write-Log "npm: $($line.ToString())" }
+    Stop-Installer 62 "No fue posible configurar npm update-notifier."
 }
 
 # -------------------------
-
 # Dependencias generales
-
 # -------------------------
 
 Write-Log "Instalando dependencias npm"
 
-$npmResult = Invoke-Npm "install --silent"
+$npmResult = Invoke-Npm "install --loglevel error"
 $npmInstallExit = [int]$npmResult.ExitCode
 
 Write-Log "npm install exit code: $npmInstallExit"
 
 if ($npmInstallExit -ne 0) {
-foreach ($line in @($npmResult.Output)) { Write-Log "npm: $($line.ToString())" }
-Stop-Installer 63 "Fall� npm install."
+    foreach ($line in @($npmResult.Output)) { 
+        if (-not [string]::IsNullOrWhiteSpace($line)) { Write-Log "npm: $($line.ToString())" }
+    }
+    Stop-Installer 63 "Fallo npm install."
 }
 
 # -------------------------
-
-# oracledb seg�n SO
-
+# oracledb segn SO
 # -------------------------
 
 Write-Log "Configurando oracledb $OracleDbVersion"
 
-$npmResult = Invoke-Npm "install oracledb@$OracleDbVersion --silent"
+$npmResult = Invoke-Npm "install oracledb@$OracleDbVersion --loglevel error"
 $oracleInstallExit = [int]$npmResult.ExitCode
 
-Write-Log "Instalaci�n oracledb exit code: $oracleInstallExit"
+Write-Log "Instalacin oracledb exit code: $oracleInstallExit"
 
 if ($oracleInstallExit -ne 0) {
-foreach ($line in @($npmResult.Output)) { Write-Log "npm: $($line.ToString())" }
-Stop-Installer 64 "Fall� la instalaci�n de oracledb@$OracleDbVersion."
+    foreach ($line in @($npmResult.Output)) { 
+        if (-not [string]::IsNullOrWhiteSpace($line)) { Write-Log "npm: $($line.ToString())" }
+    }
+    Stop-Installer 64 "Fallo la instalacion de oracledb@$OracleDbVersion."
 }
 
 # -------------------------
-
 # Verificar oracledb
-
 # -------------------------
 
 $npmResult = Invoke-Npm "list oracledb --depth=0"
@@ -762,17 +803,19 @@ $oracleList = @($npmResult.Output)
 
 Write-Log "Resultado npm list oracledb:"
 foreach ($line in $oracleList) {
-Write-Log $line.ToString()
+    Write-Log $line.ToString()
 }
 
 if ($npmResult.ExitCode -ne 0 -or ($oracleList -join "`n") -notmatch "oracledb@$OracleDbVersion") {
-foreach ($line in $oracleList) { Write-Log "npm: $($line.ToString())" }
-Stop-Installer 65 "La versi�n de oracledb instalada no corresponde a la requerida: $OracleDbVersion"
+    foreach ($line in $oracleList) { 
+        if (-not [string]::IsNullOrWhiteSpace($line)) { Write-Log "npm: $($line.ToString())" }
+    }
+    Stop-Installer 65 "La version de oracledb instalada no corresponde a la requerida: $OracleDbVersion"
 }
 
 Write-Log "oracledb ${OracleDbVersion}: OK"
-Write-Log "npm ejecutado después del reemplazo del backend"
-Write-Log "oracledb configurado después del reemplazo del backend"
+Write-Log "npm ejecutado despues del reemplazo del backend"
+Write-Log "oracledb configurado despues del reemplazo del backend"
 
 # =========================================================
 
@@ -785,7 +828,7 @@ if (-not (Test-Path $NssmExe)) {
 $NssmSource = "$BaseDir\nssm\win64\nssm.exe"
 
 if (-not (Test-Path $NssmSource)) {
-    Stop-Installer 70 "No se encontr� NSSM en $NssmSource"
+    Stop-Installer 70 "No se encontro NSSM en $NssmSource"
 }
 
 Write-Log "NSSM no encontrado. Instalando..."
@@ -873,46 +916,89 @@ Write-Log "Servicio existente conservado; no se elimina ni recrea"
 }
 
 # =========================================================
-
 # INICIAR SERVICIO
-
 # =========================================================
 
 if ($ServiceWasCreated) {
-    Write-Log "Esperando 15 segundos antes del primer arranque del servicio $ServiceName"
+    Write-Log "Estado: Esperando 15 segundos antes del primer arranque del servicio $ServiceName..."
     Start-Sleep -Seconds 15
+    Write-Log "Resultado: Espera inicial completada correctamente."
 }
 
-Write-Log "Iniciando servicio $ServiceName"
-& $NssmExe start $ServiceName
-if ($LASTEXITCODE -ne 0) {
-    Write-Log "ADVERTENCIA: NSSM devolvio codigo $LASTEXITCODE al iniciar el servicio $ServiceName; se validara el estado real del servicio."
+# Tomar una linea base para distinguir errores nuevos de mensajes historicos.
+$errLogLineCountBeforeStart = 0
+if (Test-Path "$LogDir\err.log") {
+    $errLogLineCountBeforeStart = @(
+        Get-Content -LiteralPath "$LogDir\err.log" -ErrorAction SilentlyContinue
+    ).Count
 }
+
+Write-Log "Estado: Iniciando el servicio $ServiceName..."
+
+# Usamos try/catch para capturar cualquier advertencia del SCM de Windows sin detener el instalador bruscamente
+try {
+    $startOutput = & $NssmExe start $ServiceName 2>&1
+    $startExitCode = $LASTEXITCODE
+    
+    if ($startExitCode -ne 0) {
+        Write-Log "Aviso: NSSM devolvio codigo $startExitCode al ordenar el inicio (puede tratarse de un estado pendiente transitorio). Validando estado real..."
+    } else {
+        Write-Log "Resultado: Orden de inicio enviada con exito a NSSM."
+    }
+}
+catch {
+    Write-Log "Aviso: Excepcion menor al ordenar el inicio con NSSM: $($_.Exception.Message). Procediendo a validar estado..."
+}
+
+Write-Log "Estado: Validando que el servicio $ServiceName alcance el estado 'Running'..."
+
+# Validamos mediante comprobacion de estado real (evita esperas a ciegas)
 $svcCheck = Wait-ServiceState -Name $ServiceName -DesiredState 'Running' -TimeoutSeconds $ServiceWaitTimeoutSeconds
+
 if (-not $svcCheck -or $svcCheck.Status -ne 'Running') {
+    Write-Log "ERROR: El servicio no logro iniciar en el tiempo establecido."
+    
+    if (Test-Path "$LogDir\out.log") { 
+        Get-Content -LiteralPath "$LogDir\out.log" -Tail 30 | ForEach-Object { Write-Log "out.log: $_" } 
+    }
+    if (Test-Path "$LogDir\err.log") { 
+        Get-Content -LiteralPath "$LogDir\err.log" -Tail 30 | ForEach-Object { Write-Log "err.log: $_" } 
+    }
+    
+    $failedServiceState = if ($svcCheck) { $svcCheck.Status } else { 'No encontrado' }
+    Write-Log "Estado actual detectado del servicio: $failedServiceState"
+    Stop-Installer 82 "El servicio $ServiceName fallo al iniciar y no alcanzo el estado Running dentro del timeout."
+}
+
+Write-Log "Estado: esperando 10 segundos para confirmar la estabilidad del servicio..."
+Start-Sleep -Seconds 10
+
+$stableSvcCheck = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if (-not $stableSvcCheck) {
+    Stop-Installer 82 "El servicio $ServiceName desaparecio durante la validacion de estabilidad."
+}
+$stableSvcCheck.Refresh()
+if ($stableSvcCheck.Status -ne 'Running') {
+    Write-Log "Estado final despues de la espera: $($stableSvcCheck.Status)"
     if (Test-Path "$LogDir\out.log") { Get-Content -LiteralPath "$LogDir\out.log" -Tail 30 | ForEach-Object { Write-Log "out.log: $_" } }
     if (Test-Path "$LogDir\err.log") { Get-Content -LiteralPath "$LogDir\err.log" -Tail 30 | ForEach-Object { Write-Log "err.log: $_" } }
-    $failedServiceState = if ($svcCheck) { $svcCheck.Status } else { 'No encontrado' }
-    Write-Log "Estado servicio: $failedServiceState"
-    Stop-Installer 82 "El servicio $ServiceName no alcanzo Running dentro del timeout."
+    Stop-Installer 82 "El servicio $ServiceName no se mantuvo en Running durante la validacion de estabilidad."
 }
 
-$svcCheck = Get-Service $ServiceName -ErrorAction SilentlyContinue
-
-if (-not $svcCheck) {
-Stop-Installer 81 "El servicio $ServiceName no existe despu�s de la instalaci�n."
+$errLinesAfterStart = @()
+if (Test-Path "$LogDir\err.log") {
+    $errLinesAfterStart = @(Get-Content -LiteralPath "$LogDir\err.log" -ErrorAction SilentlyContinue)
+}
+if ($errLinesAfterStart.Count -gt $errLogLineCountBeforeStart) {
+    Write-Log "ERROR: err.log recibio nuevas lineas durante la validacion de estabilidad."
+    $newErrLines = $errLinesAfterStart | Select-Object -Skip $errLogLineCountBeforeStart
+    foreach ($line in $newErrLines) { Write-Log "err.log nuevo: $line" }
+    Stop-Installer 82 "El servicio $ServiceName genero errores nuevos durante la validacion de estabilidad."
 }
 
-Write-Log "Estado servicio: $($svcCheck.Status)"
-
-if ($svcCheck.Status -ne "Running") {
-    Stop-Installer 82 "El servicio $ServiceName no quedo en estado Running."
-}
-Write-Log "Servicio ${ServiceName}: estado Running"
-Write-Log "Health HTTP no utilizado como criterio de exito del backend"
-
+Write-Log "Resultado: El servicio $ServiceName se mantuvo estable 10 segundos en Running y sin errores nuevos en err.log."
 Write-Log "Servicio ${ServiceName}: OK"
-Write-Log "Continuando con reemplazo del frontend"
+Write-Log "Continuando con reemplazo del frontend..."
 
 # =========================================================
 
@@ -923,7 +1009,7 @@ Write-Log "Continuando con reemplazo del frontend"
 $FrontendSource = "$BaseDir\out"
 
 if (-not (Test-Path $FrontendSource)) {
-Stop-Installer 90 "No se encontr� el frontend en $FrontendSource"
+Stop-Installer 90 "No se encontro el frontend en $FrontendSource"
 }
 
 Write-Log "Actualizando frontend"
@@ -984,20 +1070,20 @@ try {
 catch {
     Write-Log "ERROR reemplazando frontend: $($_.Exception.Message)"
     if ($FrontendAppPoolName -and $FrontendAppPoolNeedsStart) {
-        Write-Log "Restaurando estado inicial del AppPool después del error"
+        Write-Log "Restaurando estado inicial del AppPool despues del error"
         & $appcmd start apppool "/apppool.name:$FrontendAppPoolName" 2>&1 | ForEach-Object { Write-Log "IIS: $($_.ToString())" }
         if ($LASTEXITCODE -eq 0 -and (Wait-AppPoolState -AppCmdPath $appcmd -AppPoolName $FrontendAppPoolName -DesiredState "Started" -TimeoutSeconds $ServiceWaitTimeoutSeconds)) {
             Write-Log "AppPool iniciado correctamente"
         }
         else {
-            Write-Log "ERROR: no fue posible restaurar el AppPool $FrontendAppPoolName después del error"
+            Write-Log "ERROR: no fue posible restaurar el AppPool $FrontendAppPoolName despues del error"
         }
     }
     throw
 }
 
 if (-not (Test-Path $FrontendOut)) {
-Stop-Installer 91 "El frontend no qued� correctamente instalado."
+Stop-Installer 91 "El frontend no quedo correctamente instalado."
 }
 
 Write-Log "Frontend: OK"
@@ -1012,7 +1098,7 @@ try {
 Import-Module ServerManager -ErrorAction Stop
 }
 catch {
-Stop-Installer 30 "No fue posible cargar el m�dulo ServerManager para validar IIS."
+Stop-Installer 30 "No fue posible cargar el mdulo ServerManager para validar IIS."
 }
 
 $IisFeatures = @(
@@ -1025,31 +1111,31 @@ foreach ($FeatureName in $IisFeatures) {
         $Feature = Get-WindowsFeature -Name $FeatureName -ErrorAction Stop
     }
     catch {
-        Stop-Installer 30 "No fue posible consultar la caracter�stica IIS: $FeatureName"
+        Stop-Installer 30 "No fue posible consultar la caracteristica IIS: $FeatureName"
     }
 
     if ($Feature.InstallState -eq "Installed") {
-        Write-Log "Caracter�stica IIS ya instalada: $FeatureName"
+        Write-Log "Caracterstica IIS ya instalada: $FeatureName"
     }
     else {
-        Write-Log "Caracter�stica IIS no instalada: $FeatureName. Instalando..."
+        Write-Log "Caracterstica IIS no instalada: $FeatureName. Instalando..."
         try {
             $Result = Install-WindowsFeature -Name $FeatureName -ErrorAction Stop
         }
         catch {
-            Stop-Installer 30 "No fue posible instalar la caracter�stica IIS: $FeatureName"
+            Stop-Installer 30 "No fue posible instalar la caracteristica IIS: $FeatureName"
         }
 
         if (-not $Result.Success) {
-            Stop-Installer 30 "No fue posible instalar la caracter�stica IIS: $FeatureName"
+            Stop-Installer 30 "No fue posible instalar la caracteristica IIS: $FeatureName"
         }
 
         $FeatureAfter = Get-WindowsFeature -Name $FeatureName -ErrorAction SilentlyContinue
         if (-not $FeatureAfter -or $FeatureAfter.InstallState -ne "Installed") {
-            Stop-Installer 31 "La caracter�stica IIS $FeatureName no qued� instalada correctamente"
+            Stop-Installer 31 "La caracteristica IIS $FeatureName no quedo instalada correctamente"
         }
 
-        Write-Log "Caracter�stica IIS instalada correctamente: $FeatureName"
+        Write-Log "Caracterstica IIS instalada correctamente: $FeatureName"
     }
 }
 
@@ -1060,7 +1146,7 @@ foreach ($FeatureName in $IisFeatures) {
 # =========================================================
 
 if (-not (Test-Path $appcmd)) {
-Stop-Installer 92 "No se encontr� appcmd.exe. IIS no est� disponible."
+Stop-Installer 92 "No se encontro appcmd.exe. IIS no esta disponible."
 }
 
 $site = & $appcmd list site "impresionEtiquetas" 2>$null
@@ -1099,7 +1185,7 @@ if ($LASTEXITCODE -ne 0) {
     Stop-Installer 93 "No fue posible asegurar el binding HTTP *:81 del sitio IIS."
 }
 
-Write-Log "Ruta f�sica IIS verificada"
+Write-Log "Ruta fsica IIS verificada"
 
 }
 
@@ -1114,7 +1200,7 @@ if ($FrontendAppPoolName -and $FrontendAppPoolNeedsStart) {
 
 # =========================================================
 
-# VALIDACI�N FINAL
+# VALIDACIN FINAL
 
 # =========================================================
 
@@ -1123,57 +1209,57 @@ Write-Log "VALIDACION FINAL"
 Write-Log "=========================================="
 
 if (-not (Test-Path $NodeExe)) {
-Stop-Installer 100 "Validaci�n final: falta node.exe."
+Stop-Installer 100 "Validacin final: falta node.exe."
 }
 
 if (-not (Test-Path $NpmCmd)) {
-Stop-Installer 101 "Validaci�n final: falta npm.cmd."
+Stop-Installer 101 "Validacin final: falta npm.cmd."
 }
 
 if (-not (Test-Path "$Backend\index.js")) {
-Stop-Installer 102 "Validaci�n final: falta backend index.js."
+Stop-Installer 102 "Validacin final: falta backend index.js."
 }
 
 if (-not (Test-Path "$OracleIC\oci.dll")) {
-Stop-Installer 103 "Validaci�n final: falta oci.dll."
+Stop-Installer 103 "Validacin final: falta oci.dll."
 }
 
 if (-not (Test-Path $NssmExe)) {
-Stop-Installer 104 "Validaci�n final: falta NSSM."
+Stop-Installer 104 "Validacin final: falta NSSM."
 }
 
 if (-not (Test-Path $FrontendOut)) {
-Stop-Installer 105 "Validaci�n final: falta frontend."
+Stop-Installer 105 "Validacin final: falta frontend."
 }
 
 $finalSvc = Get-Service $ServiceName -ErrorAction SilentlyContinue
 
 if (-not $finalSvc) {
-Stop-Installer 106 "Validaci�n final: servicio no existe."
+Stop-Installer 106 "Validacion final: servicio no existe."
 }
 
 if ($finalSvc.Status -ne "Running") {
-    Stop-Installer 106 "Validaci�n final: servicio no quedo Running."
+    Stop-Installer 106 "Validacion final: servicio no quedo Running."
 }
 
-Write-Log "Validaci�n final servicio: $($finalSvc.Status)"
+Write-Log "Validacin final servicio: $($finalSvc.Status)"
 
 $finalSite = & $appcmd list site "impresionEtiquetas" 2>$null
 
 if (-not $finalSite) {
-Stop-Installer 107 "Validaci�n final: sitio IIS no existe."
+Stop-Installer 107 "Validacion final: sitio IIS no existe."
 }
 
 $finalBinding = (& $appcmd list site "impresionEtiquetas" /text:bindings 2>$null) -join "`n"
 $finalPhysicalPath = (& $appcmd list vdir "impresionEtiquetas/" /text:physicalPath 2>$null) -join "`n"
 if ($finalBinding -notmatch [regex]::Escape("*:81:") -or $finalBinding -notmatch 'http') {
-    Stop-Installer 108 "Validaci�n final: IIS no tiene el binding HTTP *:81."
+    Stop-Installer 108 "Validacin final: IIS no tiene el binding HTTP *:81."
 }
 if ($finalPhysicalPath.Trim() -ne $FrontendOut) {
-    Stop-Installer 109 "Validaci�n final: IIS apunta a '$($finalPhysicalPath.Trim())' en vez de '$FrontendOut'."
+    Stop-Installer 109 "Validacin final: IIS apunta a '$($finalPhysicalPath.Trim())' en vez de '$FrontendOut'."
 }
 if (-not (Test-FrontendHealth -Url "http://localhost:81")) {
-    Stop-Installer 110 "Validaci�n final: el frontend no responde en http://localhost:81."
+    Stop-Installer 110 "Validacion final: el frontend no responde en http://localhost:81."
 }
 
 Write-Log "Node.js: OK"
@@ -1196,4 +1282,3 @@ try { Stop-Transcript | Out-Null } catch {}
 }
 
 exit 0
-
